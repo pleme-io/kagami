@@ -1,13 +1,19 @@
-//! BFS web crawler with SOCKS5 proxy support.
+//! BFS web crawler with SOCKS5 proxy support and optional kakuremino anonymous transport.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use chrono::Utc;
+use http_body_util::{BodyExt, Empty};
+use hyper::Request;
+use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use kagami_core::{CrawlResult, CrawlTarget, CrawledPage, Crawler, Error, Result};
+use kakuremino::AnonTransport;
 
 use crate::extractor::LinkExtractor;
 
@@ -15,6 +21,13 @@ use crate::extractor::LinkExtractor;
 const DEFAULT_SOCKS_PROXY: &str = "socks5h://127.0.0.1:9050";
 
 /// A breadth-first crawler that follows links up to a configurable depth.
+///
+/// Supports two modes for `.onion` crawling:
+/// - **SOCKS5 proxy** (default): uses `reqwest` with a SOCKS5 proxy URL.
+/// - **kakuremino transport**: uses an [`AnonTransport`] implementation (e.g.,
+///   [`kakuremino::TorTransport`]) for anonymous connectivity via Arti.
+///
+/// For clearnet URLs, the crawler always falls back to the `reqwest` client.
 pub struct BfsCrawler {
     /// Maximum link-follow depth (0 = seed page only).
     pub max_depth: u32,
@@ -24,6 +37,8 @@ pub struct BfsCrawler {
     pub user_agent: String,
     /// Optional SOCKS5 proxy URL (defaults to Tor on 9050).
     pub socks_proxy: Option<String>,
+    /// Optional anonymous transport for `.onion` URL crawling.
+    transport: Option<Arc<dyn AnonTransport>>,
     /// Set of already-visited URLs (persists across calls for dedup).
     visited: HashSet<String>,
 }
@@ -36,8 +51,32 @@ impl BfsCrawler {
             max_pages,
             user_agent: String::from("kagami/0.1"),
             socks_proxy: Some(DEFAULT_SOCKS_PROXY.to_string()),
+            transport: None,
             visited: HashSet::new(),
         }
+    }
+
+    /// Set an anonymous transport for `.onion` URL crawling.
+    ///
+    /// When set, `.onion` URLs are fetched through the transport instead of
+    /// the SOCKS5 proxy. Non-`.onion` URLs continue to use `reqwest`.
+    #[must_use]
+    pub fn with_transport(mut self, transport: Arc<dyn AnonTransport>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Create a crawler pre-configured to use kakuremino's `TorTransport`.
+    ///
+    /// The Tor client is bootstrapped eagerly. This may take 10-30 seconds on
+    /// the first call while Tor consensus is downloaded and circuits are built.
+    pub async fn with_tor(max_depth: u32, max_pages: u32) -> Result<Self> {
+        info!("bootstrapping kakuremino TorTransport for BfsCrawler");
+        let transport = kakuremino::TorTransport::bootstrap()
+            .await
+            .map_err(|e| Error::Http(format!("kakuremino Tor bootstrap failed: {e}")))?;
+        let transport: Arc<dyn AnonTransport> = Arc::new(transport);
+        Ok(Self::new(max_depth, max_pages).with_transport(transport))
     }
 
     /// Build an HTTP client, optionally with SOCKS5 proxy.
@@ -60,6 +99,78 @@ impl BfsCrawler {
         let mut hasher = Sha256::new();
         hasher.update(body.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    /// Returns `true` if the URL points to a `.onion` hidden service.
+    fn is_onion_url(url_str: &str) -> bool {
+        url::Url::parse(url_str)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.ends_with(".onion")))
+            .unwrap_or(false)
+    }
+
+    /// Fetch a `.onion` URL through the kakuremino transport.
+    ///
+    /// Establishes a raw TCP-like connection via `connect_onion`, then performs
+    /// an HTTP/1.1 GET request using `hyper`.
+    async fn fetch_via_transport(
+        transport: &dyn AnonTransport,
+        url_str: &str,
+        user_agent: &str,
+    ) -> Result<(u16, String)> {
+        let parsed =
+            url::Url::parse(url_str).map_err(|e| Error::Http(format!("invalid URL: {e}")))?;
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| Error::Http("URL has no host".to_string()))?;
+        let port = parsed.port().unwrap_or(80);
+        let path = if parsed.path().is_empty() {
+            "/"
+        } else {
+            parsed.path()
+        };
+
+        debug!(host, port, path, "connecting via kakuremino transport");
+        let stream = transport
+            .connect_onion(host, port)
+            .await
+            .map_err(|e| Error::Http(format!("kakuremino connect_onion failed: {e}")))?;
+
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| Error::Http(format!("HTTP handshake failed: {e}")))?;
+
+        // Drive the connection in the background.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                warn!("HTTP connection error: {e}");
+            }
+        });
+
+        let req = Request::builder()
+            .uri(path)
+            .header("Host", host)
+            .header("User-Agent", user_agent)
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| Error::Http(format!("failed to build request: {e}")))?;
+
+        let response = sender
+            .send_request(req)
+            .await
+            .map_err(|e| Error::Http(format!("HTTP request failed: {e}")))?;
+
+        let status = response.status().as_u16();
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| Error::Http(format!("failed to read response body: {e}")))?
+            .to_bytes();
+
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
+        Ok((status, body))
     }
 }
 
@@ -91,14 +202,26 @@ impl Crawler for BfsCrawler {
             self.visited.insert(url.clone());
             debug!(url = %url, depth, "crawling");
 
-            match client.get(&url).send().await {
-                Ok(response) => {
-                    let status_code = response.status().as_u16();
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_default();
+            // Choose fetch strategy: kakuremino transport for .onion when
+            // available, reqwest for everything else.
+            let fetch_result =
+                if Self::is_onion_url(&url) && self.transport.is_some() {
+                    let transport = self.transport.as_ref().unwrap();
+                    Self::fetch_via_transport(transport.as_ref(), &url, &self.user_agent).await
+                } else {
+                    // Fall back to reqwest (with optional SOCKS5 proxy).
+                    match client.get(&url).send().await {
+                        Ok(response) => {
+                            let status_code = response.status().as_u16();
+                            let body = response.text().await.unwrap_or_default();
+                            Ok((status_code, body))
+                        }
+                        Err(e) => Err(Error::Http(e.to_string())),
+                    }
+                };
 
+            match fetch_result {
+                Ok((status_code, body)) => {
                     let links = LinkExtractor::extract_links(&body, &url);
                     let content_hash = Self::hash_content(&body);
 
@@ -179,5 +302,23 @@ mod tests {
 
         let hash3 = BfsCrawler::hash_content("different content");
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn transport_defaults_to_none() {
+        let crawler = BfsCrawler::new(2, 50);
+        assert!(crawler.transport.is_none());
+    }
+
+    #[test]
+    fn detects_onion_urls() {
+        assert!(BfsCrawler::is_onion_url(
+            "http://duskgytldkxiuqc6.onion/page"
+        ));
+        assert!(BfsCrawler::is_onion_url(
+            "http://exampleonion1234567890abcdef.onion"
+        ));
+        assert!(!BfsCrawler::is_onion_url("https://example.com"));
+        assert!(!BfsCrawler::is_onion_url("not-a-url"));
     }
 }

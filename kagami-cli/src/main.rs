@@ -37,6 +37,10 @@ enum Command {
         /// Disable SOCKS5 proxy (direct connection).
         #[arg(long, default_value_t = false)]
         no_proxy: bool,
+
+        /// Use kakuremino anonymous transport (Arti Tor) instead of raw SOCKS5.
+        #[arg(long, default_value_t = false)]
+        use_kakuremino: bool,
     },
 
     /// Monitor domains for credential leaks.
@@ -80,13 +84,20 @@ async fn main() -> kagami_core::Result<()> {
             max_pages,
             proxy,
             no_proxy,
+            use_kakuremino,
         } => {
-            let mut crawler = BfsCrawler::new(depth, max_pages);
-            if no_proxy {
-                crawler.socks_proxy = None;
-            } else if let Some(p) = proxy {
-                crawler.socks_proxy = Some(p);
-            }
+            let mut crawler = if use_kakuremino {
+                tracing::info!("using kakuremino TorTransport for anonymous crawling");
+                BfsCrawler::with_tor(depth, max_pages).await?
+            } else {
+                let mut c = BfsCrawler::new(depth, max_pages);
+                if no_proxy {
+                    c.socks_proxy = None;
+                } else if let Some(p) = proxy {
+                    c.socks_proxy = Some(p);
+                }
+                c
+            };
 
             let target = CrawlTarget {
                 url,

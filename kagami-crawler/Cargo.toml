@@ -13,8 +13,13 @@ workspace = true
 
 [dependencies]
 kagami-core = { path = "../kagami-core" }
+kakuremino = { git = "https://github.com/pleme-io/kakuremino", default-features = false, features = ["tor"] }
 async-trait = "0.1"
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
 scraper = "0.22"
