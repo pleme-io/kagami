@@ -69,14 +69,10 @@ enum Command {
     Status,
 }
 
-#[tokio::main]
-async fn main() -> kagami_core::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
-    let cli = Cli::parse();
-
+/// Execute the CLI with the given arguments.
+///
+/// Extracted for testability — `main` delegates here after initializing tracing.
+async fn execute(cli: Cli) -> kagami_core::Result<()> {
     match cli.command {
         Command::Crawl {
             url,
@@ -124,7 +120,7 @@ async fn main() -> kagami_core::Result<()> {
             } else {
                 tracing::info!("found {} indicators", all_indicators.len());
                 let json = serde_json::to_string_pretty(&all_indicators)
-                    .map_err(kagami_core::Error::Serde)?;
+                    .map_err(kagami_core::Error::from)?;
                 println!("{json}");
             }
         }
@@ -138,7 +134,7 @@ async fn main() -> kagami_core::Result<()> {
             } else {
                 tracing::warn!("detected {} leaked credentials", leaks.len());
                 let json =
-                    serde_json::to_string_pretty(&leaks).map_err(kagami_core::Error::Serde)?;
+                    serde_json::to_string_pretty(&leaks).map_err(kagami_core::Error::from)?;
                 println!("{json}");
             }
         }
@@ -148,9 +144,9 @@ async fn main() -> kagami_core::Result<()> {
             input,
             output,
         } => {
-            let raw = std::fs::read_to_string(&input).map_err(kagami_core::Error::Io)?;
+            let raw = std::fs::read_to_string(&input)?;
             let indicators: Vec<kagami_core::ThreatIndicator> =
-                serde_json::from_str(&raw).map_err(kagami_core::Error::Serde)?;
+                serde_json::from_str(&raw).map_err(kagami_core::Error::from)?;
 
             let exporter = StixExporter;
             let exported = match format.as_str() {
@@ -159,7 +155,7 @@ async fn main() -> kagami_core::Result<()> {
             };
 
             if let Some(path) = output {
-                std::fs::write(&path, &exported).map_err(kagami_core::Error::Io)?;
+                std::fs::write(&path, &exported)?;
                 tracing::info!("exported to {path}");
             } else {
                 println!("{exported}");
@@ -172,4 +168,14 @@ async fn main() -> kagami_core::Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> kagami_core::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let cli = Cli::parse();
+    execute(cli).await
 }

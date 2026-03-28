@@ -3,14 +3,26 @@
 Defensive OSINT tool for crawling .onion sites, extracting threat indicators,
 monitoring credential leaks, and exporting intelligence as STIX 2.1 bundles.
 
+**Tests:** 48
+
 ## Architecture
 
 ```
 kagami-core       — traits (Crawler, ThreatFeedProvider, LeakMonitor, IntelExporter) + types
 kagami-crawler    — BFS crawler (reqwest + SOCKS5), link/indicator extraction (regex, scraper)
 kagami-intel      — STIX 2.1 exporter, pattern-based leak monitor
-kagami-cli        — clap CLI: crawl, watch, export, status
+kagami-cli        — clap CLI: crawl, watch, export, status — execute() extracted for testability
 ```
+
+### Key Types
+
+| Type | Kind | Description |
+|------|------|-------------|
+| `StixObjectType` | Enum | 10 STIX 2.1 types (AttackPattern, Campaign, CourseOfAction, Identity, Indicator, IntrusionSet, Malware, ObservedData, ThreatActor, Vulnerability) |
+| `TlpMarking` | Enum | 5 TLP levels (White, Green, Amber, AmberStrict, Red) + can_share() method |
+| `CrawlState` | Enum | 8 states (Pending, Fetching, Parsing, Extracted, Indexed, Failed, Skipped, Complete) + is_terminal() method |
+| `Confidence` | Newtype | 0-100 confidence score + label() method (returns Low/Medium/High) |
+| `Error` | Struct | Clone + PartialEq + is_retryable() |
 
 ## Crawling Strategy
 
