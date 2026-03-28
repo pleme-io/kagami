@@ -1,0 +1,23 @@
+[package]
+name = "kagami-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "CLI for kagami dark web monitor and threat intelligence"
+
+[lints]
+workspace = true
+
+[dependencies]
+kagami-core = { path = "../kagami-core" }
+kagami-crawler = { path = "../kagami-crawler" }
+kagami-intel = { path = "../kagami-intel" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+shikumi = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
